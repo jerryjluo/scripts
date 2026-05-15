@@ -364,10 +364,10 @@ def event_age_seconds(ts_iso: str) -> float:
     return max(0.0, time.time() - dt.timestamp())
 
 
-def format_event_cell(ev: ActivityEvent, *, is_last: bool, base_indent: str) -> str:
+def format_event_cell(ev: ActivityEvent, *, is_last: bool) -> str:
     branch = "╰─" if is_last else "├─"
     glyph, color = EVENT_GLYPH.get(ev.kind, ("·", "white"))
-    return f"[dim]{base_indent}{branch}[/] [{color}]{glyph}[/] {ev.label}"
+    return f"[dim]{branch}[/] [{color}]{glyph}[/] {ev.label}"
 
 
 def deep_link(target: str) -> None:
@@ -501,15 +501,15 @@ class SessionsApp(App):
         )
         self.row_targets.append(s.tmux_target)
         if self.show_details and s.recent_events:
-            base_indent = "    " if indent else "  "
             n = len(s.recent_events)
             for i, ev in enumerate(s.recent_events):
                 is_last = i == n - 1
                 table.add_row(
                     "",
                     f"[dim]{format_age(event_age_seconds(ev.ts_iso))}[/]",
-                    format_event_cell(ev, is_last=is_last, base_indent=base_indent),
-                    "", "", "", "",
+                    "",
+                    format_event_cell(ev, is_last=is_last),
+                    "", "", "",
                 )
                 self.row_targets.append("")
 
