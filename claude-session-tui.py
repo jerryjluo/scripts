@@ -38,7 +38,7 @@ PROJECTS_DIR = Path.home() / ".claude" / "projects"
 _META_CACHE: dict[str, tuple[float, str, int, list["ActivityEvent"]]] = {}
 
 # Default model context window in tokens. Override with CLAUDE_CONTEXT_LIMIT env.
-CONTEXT_LIMIT = int(os.environ.get("CLAUDE_CONTEXT_LIMIT", "200000"))
+CONTEXT_LIMIT = int(os.environ.get("CLAUDE_CONTEXT_LIMIT", "1000000"))
 
 # Number of recent activity events to display under each session row.
 DETAIL_ROWS = 3
@@ -326,11 +326,11 @@ def format_ctx(tokens: int, limit: int = CONTEXT_LIMIT) -> str:
     else:
         label = str(tokens)
     pct = tokens / limit if limit > 0 else 0
-    if pct < 0.5:
+    if pct < 0.2:
         style = "green"
-    elif pct < 0.75:
+    elif pct < 0.4:
         style = "yellow"
-    elif pct < 0.9:
+    elif pct < 0.6:
         style = "dark_orange"
     else:
         style = "red"
