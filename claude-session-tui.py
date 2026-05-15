@@ -31,8 +31,12 @@ from textual.widgets import DataTable, Footer, Static
 SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
-# Cache of session title lookups: sessionId -> (jsonl_mtime, title)
-_TITLE_CACHE: dict[str, tuple[float, str]] = {}
+# Per-session jsonl-derived info, cached by file mtime.
+# sessionId -> (jsonl_mtime, title, context_tokens)
+_META_CACHE: dict[str, tuple[float, str, int]] = {}
+
+# Default model context window in tokens. Override with CLAUDE_CONTEXT_LIMIT env.
+CONTEXT_LIMIT = int(os.environ.get("CLAUDE_CONTEXT_LIMIT", "200000"))
 
 TERM_BUNDLE_IDS = {
     "ghostty": "com.mitchellh.ghostty",
@@ -53,6 +57,7 @@ class Session:
     updated_at_ms: int
     tmux_target: str  # e.g. "main:2.0"
     title: str = ""
+    ctx_tokens: int = 0
 
     @property
     def age_seconds(self) -> float:
@@ -111,39 +116,65 @@ def tmux_panes() -> dict[str, str]:
     return panes
 
 
-def session_title(session_id: str) -> str:
-    """Return the most recent ai-title for a session, cached by jsonl mtime."""
+def session_meta(session_id: str) -> tuple[str, int]:
+    """Return (latest ai-title, latest assistant context_tokens) for a session.
+
+    context_tokens = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+    from the most recent assistant message's usage block. Cached by jsonl mtime.
+    """
     if not session_id:
-        return ""
+        return "", 0
     matches = list(PROJECTS_DIR.glob(f"*/{session_id}.jsonl")) if PROJECTS_DIR.is_dir() else []
     if not matches:
-        return _TITLE_CACHE.get(session_id, (0.0, ""))[1]
+        cached = _META_CACHE.get(session_id)
+        return (cached[1], cached[2]) if cached else ("", 0)
     jsonl = matches[0]
     try:
         mtime = jsonl.stat().st_mtime
     except OSError:
-        return _TITLE_CACHE.get(session_id, (0.0, ""))[1]
-    cached = _TITLE_CACHE.get(session_id)
+        cached = _META_CACHE.get(session_id)
+        return (cached[1], cached[2]) if cached else ("", 0)
+    cached = _META_CACHE.get(session_id)
     if cached and cached[0] == mtime:
-        return cached[1]
+        return cached[1], cached[2]
     title = ""
+    ctx_tokens = 0
     try:
         with jsonl.open("r", encoding="utf-8", errors="replace") as f:
             for line in f:
-                if '"ai-title"' not in line:
+                if '"ai-title"' in line:
+                    try:
+                        d = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if d.get("type") == "ai-title":
+                        candidate = d.get("aiTitle")
+                        if isinstance(candidate, str) and candidate:
+                            title = candidate
+                    continue
+                if '"usage"' not in line:
                     continue
                 try:
                     d = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if d.get("type") == "ai-title":
-                    candidate = d.get("aiTitle")
-                    if isinstance(candidate, str) and candidate:
-                        title = candidate
+                msg = d.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                usage = msg.get("usage")
+                if not isinstance(usage, dict):
+                    continue
+                total = (
+                    int(usage.get("input_tokens", 0) or 0)
+                    + int(usage.get("cache_creation_input_tokens", 0) or 0)
+                    + int(usage.get("cache_read_input_tokens", 0) or 0)
+                )
+                if total > 0:
+                    ctx_tokens = total
     except OSError:
         pass
-    _TITLE_CACHE[session_id] = (mtime, title)
-    return title
+    _META_CACHE[session_id] = (mtime, title, ctx_tokens)
+    return title, ctx_tokens
 
 
 def load_sessions() -> list[Session]:
@@ -170,6 +201,7 @@ def load_sessions() -> list[Session]:
         if not target:
             continue
         session_id = str(data.get("sessionId", ""))
+        title, ctx_tokens = session_meta(session_id)
         sessions.append(Session(
             pid=pid,
             session_id=session_id,
@@ -178,7 +210,8 @@ def load_sessions() -> list[Session]:
             started_at_ms=int(data.get("startedAt", 0)),
             updated_at_ms=int(data.get("updatedAt", 0)),
             tmux_target=target,
-            title=session_title(session_id),
+            title=title,
+            ctx_tokens=ctx_tokens,
         ))
     return sessions
 
@@ -192,6 +225,25 @@ STATUS_STYLE = {
 def status_cell(status: str) -> str:
     label = status or "—"
     style = STATUS_STYLE.get(status, "dim")
+    return f"[{style}]{label}[/]"
+
+
+def format_ctx(tokens: int, limit: int = CONTEXT_LIMIT) -> str:
+    if tokens <= 0:
+        return "[dim]—[/]"
+    if tokens >= 1000:
+        label = f"{tokens / 1000:.0f}K"
+    else:
+        label = str(tokens)
+    pct = tokens / limit if limit > 0 else 0
+    if pct < 0.5:
+        style = "green"
+    elif pct < 0.75:
+        style = "yellow"
+    elif pct < 0.9:
+        style = "dark_orange"
+    else:
+        style = "red"
     return f"[{style}]{label}[/]"
 
 
@@ -238,7 +290,8 @@ class SessionsApp(App):
     Screen { layout: vertical; }
     #header { height: 1; padding: 0 1; background: $boost; }
     DataTable { height: 1fr; }
-    DataTable > .datatable--cursor { background: $accent; color: $text; }
+    DataTable > .datatable--cursor { background: $accent 60%; text-style: bold; }
+    DataTable > .datatable--cursor-row { background: $accent 30%; }
     """
 
     BINDINGS = [
@@ -269,7 +322,8 @@ class SessionsApp(App):
 
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
-        table.add_columns("Status", "Age", "Directory", "Session", "Pane", "Name")
+        table.cursor_foreground_priority = "renderable"
+        table.add_columns("Status", "Age", "Directory", "Name", "Ctx", "Session", "Pane")
         self.refresh_sessions()
         self._timer = self.set_interval(1.0, self._tick)
 
@@ -309,7 +363,7 @@ class SessionsApp(App):
             for s in sessions:
                 groups.setdefault(s.cwd_short, []).append(s)
             for cwd_short in sorted(groups.keys(), key=str.lower):
-                table.add_row("", "", f"[bold cyan]{cwd_short}[/]", "", "", "")
+                table.add_row("", "", f"[bold cyan]{cwd_short}[/]", "", "", "", "")
                 self.row_targets.append("")
                 for s in sorted(groups[cwd_short], key=lambda x: x.age_seconds):
                     self._add_session_row(table, s, indent=True)
@@ -330,9 +384,10 @@ class SessionsApp(App):
             status_cell(s.status),
             format_age(s.age_seconds),
             cwd_cell,
+            s.title or "[dim]—[/]",
+            format_ctx(s.ctx_tokens),
             s.session_id[:8],
             s.tmux_target,
-            s.title or "[dim]—[/]",
         )
         self.row_targets.append(s.tmux_target)
 
