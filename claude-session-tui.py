@@ -215,6 +215,11 @@ def deep_link(target: str) -> None:
         )
     session, _, rest = target.partition(":")
     window, _, pane = rest.partition(".")
+    # switch-client first so cross-session jumps actually move the client.
+    subprocess.run(
+        ["tmux", "switch-client", "-t", session],
+        capture_output=True, timeout=2,
+    )
     subprocess.run(
         ["tmux", "select-window", "-t", f"{session}:{window}"],
         capture_output=True, timeout=2,
