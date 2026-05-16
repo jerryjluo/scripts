@@ -421,7 +421,7 @@ class SessionsApp(App):
 
     sort_mode: reactive[str] = reactive("age")
     group_by_dir: reactive[bool] = reactive(False)
-    show_details: reactive[bool] = reactive(True)
+    show_details: reactive[bool] = reactive(False)
     auto_refresh: reactive[bool] = reactive(True)
 
     def __init__(self) -> None:
@@ -438,7 +438,7 @@ class SessionsApp(App):
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
         table.cursor_foreground_priority = "renderable"
-        table.add_columns("Status", "Age", "Directory", "Name", "Ctx", "Session", "Pane")
+        table.add_columns("Status", "Age", "Tmux", "Directory", "Name", "Ctx", "Session")
         self.refresh_sessions()
         self._timer = self.set_interval(1.0, self._tick)
 
@@ -478,7 +478,7 @@ class SessionsApp(App):
             for s in sessions:
                 groups.setdefault(s.cwd_short, []).append(s)
             for cwd_short in sorted(groups.keys(), key=str.lower):
-                table.add_row("", "", f"[bold cyan]{cwd_short}[/]", "", "", "", "")
+                table.add_row("", "", "", f"[bold cyan]{cwd_short}[/]", "", "", "")
                 self.row_targets.append("")
                 for s in sorted(groups[cwd_short], key=lambda x: x.age_seconds):
                     self._add_session_row(table, s, indent=True)
@@ -490,14 +490,15 @@ class SessionsApp(App):
 
     def _add_session_row(self, table: DataTable, s: Session, *, indent: bool) -> None:
         cwd_cell = ("  " + (Path(s.cwd).name or s.cwd_short)) if indent else s.cwd_short
+        tmux_session = s.tmux_target.split(":", 1)[0]
         table.add_row(
             status_cell(s.status),
             format_age(s.age_seconds),
+            tmux_session,
             cwd_cell,
             s.title or "[dim]—[/]",
             format_ctx(s.ctx_tokens),
             s.session_id[:8],
-            s.tmux_target,
         )
         self.row_targets.append(s.tmux_target)
         if self.show_details and s.recent_events:
@@ -508,8 +509,9 @@ class SessionsApp(App):
                     "",
                     f"[dim]{format_age(event_age_seconds(ev.ts_iso))}[/]",
                     "",
+                    "",
                     format_event_cell(ev, is_last=is_last),
-                    "", "", "",
+                    "", "",
                 )
                 self.row_targets.append("")
 
