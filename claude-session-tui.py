@@ -343,7 +343,7 @@ def format_age(seconds: float) -> str:
     if seconds < 3600:
         return f"{int(seconds / 60)}m"
     if seconds < 86400:
-        return f"{seconds / 3600:.1f}h"
+        return f"{int(seconds / 3600)}h"
     return f"{int(seconds / 86400)}d"
 
 
