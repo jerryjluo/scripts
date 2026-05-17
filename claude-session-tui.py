@@ -130,7 +130,8 @@ def tmux_panes() -> dict[str, str]:
 
 
 def _truncate(s: str, n: int = 80) -> str:
-    s = s.strip().splitlines()[0] if s else ""
+    lines = s.strip().splitlines() if s else []
+    s = lines[0] if lines else ""
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
