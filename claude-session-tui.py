@@ -412,6 +412,7 @@ class SessionsApp(App):
         Binding("j,down", "cursor_down", "Down", show=False),
         Binding("k,up", "cursor_up", "Up", show=False),
         Binding("enter", "open", "Open", priority=True),
+        Binding("y", "yank", "Yank id"),
         Binding("s", "cycle_sort", "Sort"),
         Binding("g", "toggle_group", "Group"),
         Binding("d", "toggle_details", "Details"),
@@ -429,6 +430,7 @@ class SessionsApp(App):
         super().__init__()
         self.sessions: list[Session] = []
         self.row_targets: list[str] = []  # parallel to table rows; "" = group header
+        self.row_session_ids: list[str] = []  # parallel to table rows; full session id
         self._timer = None
 
     def compose(self) -> ComposeResult:
@@ -471,6 +473,7 @@ class SessionsApp(App):
         table = self.query_one(DataTable)
         table.clear()
         self.row_targets = []
+        self.row_session_ids = []
 
         sessions = self._sorted_sessions()
 
@@ -481,6 +484,7 @@ class SessionsApp(App):
             for cwd_short in sorted(groups.keys(), key=str.lower):
                 table.add_row("", "", "", f"[bold cyan]{cwd_short}[/]", "", "", "")
                 self.row_targets.append("")
+                self.row_session_ids.append("")
                 for s in sorted(groups[cwd_short], key=lambda x: x.age_seconds):
                     self._add_session_row(table, s, indent=True)
         else:
@@ -502,6 +506,7 @@ class SessionsApp(App):
             s.session_id[:8],
         )
         self.row_targets.append(s.tmux_target)
+        self.row_session_ids.append(s.session_id)
         if self.show_details and s.recent_events:
             n = len(s.recent_events)
             for i, ev in enumerate(s.recent_events):
@@ -515,6 +520,7 @@ class SessionsApp(App):
                     "", "",
                 )
                 self.row_targets.append("")
+                self.row_session_ids.append("")
 
     def _update_header(self) -> None:
         auto = "on" if self.auto_refresh else "off"
@@ -525,7 +531,7 @@ class SessionsApp(App):
             f"Claude Sessions  •  {count} live  •  "
             f"sort: [b]{self.sort_mode}[/]  group: [b]{group}[/]  "
             f"details: [b]{details}[/]  auto-refresh: [b]{auto}[/]  "
-            f"[dim](j/k move · enter open · s sort · g group · d details · a auto · r refresh · q quit)[/]"
+            f"[dim](j/k move · enter open · y yank id · s sort · g group · d details · a auto · r refresh · q quit)[/]"
         )
 
     # Actions ---------------------------------------------------------------
@@ -561,6 +567,20 @@ class SessionsApp(App):
         if not target:
             return
         self.exit(result=target)
+
+    def action_yank(self) -> None:
+        table = self.query_one(DataTable)
+        if not (0 <= table.cursor_row < len(self.row_session_ids)):
+            return
+        session_id = self.row_session_ids[table.cursor_row]
+        if not session_id:
+            return
+        try:
+            subprocess.run(["pbcopy"], input=session_id, text=True, timeout=2)
+        except (subprocess.SubprocessError, FileNotFoundError):
+            self.notify("Failed to copy session id", severity="error")
+            return
+        self.notify(f"Copied {session_id}")
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         # DataTable swallows Enter; route its RowSelected to our open action.
