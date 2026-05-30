@@ -71,6 +71,11 @@ class Session:
     title: str = ""
     ctx_tokens: int = 0
     recent_events: list[ActivityEvent] = field(default_factory=list)
+    bridge_session_id: str = ""  # set when connected to remote control (the bridge)
+
+    @property
+    def is_remote(self) -> bool:
+        return bool(self.bridge_session_id)
 
     @property
     def age_seconds(self) -> float:
@@ -303,6 +308,7 @@ def load_sessions() -> list[Session]:
             title=title,
             ctx_tokens=ctx_tokens,
             recent_events=events,
+            bridge_session_id=str(data.get("bridgeSessionId", "")),
         ))
     return sessions
 
@@ -313,10 +319,14 @@ STATUS_STYLE = {
 }
 
 
-def status_cell(status: str) -> str:
+def status_cell(status: str, *, remote: bool = False) -> str:
     label = status or "—"
     style = STATUS_STYLE.get(status, "dim")
-    return f"[{style}]{label}[/]"
+    cell = f"[{style}]{label}[/]"
+    if remote:
+        # Badge sessions driven by remote control (the bridge).
+        cell += " [bold blue]🔗[/]"
+    return cell
 
 
 def format_ctx(tokens: int, limit: int = CONTEXT_LIMIT) -> str:
@@ -497,7 +507,7 @@ class SessionsApp(App):
         cwd_cell = ("  " + (Path(s.cwd).name or s.cwd_short)) if indent else s.cwd_short
         tmux_session = s.tmux_target.split(":", 1)[0]
         table.add_row(
-            status_cell(s.status),
+            status_cell(s.status, remote=s.is_remote),
             format_age(s.age_seconds),
             tmux_session,
             cwd_cell,
