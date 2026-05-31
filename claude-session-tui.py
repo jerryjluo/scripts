@@ -5,12 +5,24 @@
 #     "textual>=0.85",
 # ]
 # ///
-"""TUI for browsing live Claude Code sessions that have an attached tmux pane.
+"""TUI for browsing live Claude Code sessions.
 
-Reads ~/.claude/sessions/*.json, drops dead pids and any pid not mapped to a
-tmux pane on the current tmux server, and renders a sortable/groupable list.
-Enter deep-links to the pane (osascript activate + tmux select-window/pane),
-mirroring ~/.claude/hooks/focus-terminal.sh.
+Reads ~/.claude/sessions/*.json and shows two kinds of live session:
+interactive sessions attached to a tmux pane, and background jobs (kind ==
+"bg", hosted detached by the `claude daemon`). Interactive rows that don't map
+to a current tmux pane are dropped; background rows are always kept, badged
+"BG".
+
+A background job's own process has no controlling tty, but it can be *attached*
+— viewed in a `claude agents` / `claude attach` pane, whose tmux title is set
+to the job's name. We match that title to recover a jump target, so:
+
+  - interactive + attached bg jobs: Enter deep-links to the pane (osascript
+    activate + tmux select-window/pane, mirroring focus-terminal.sh).
+  - detached bg jobs: no pane, so Enter instead yanks a `claude attach
+    <short-id>` command.
+
+y always yanks the full session id; d shows recent activity.
 """
 
 from __future__ import annotations
@@ -72,10 +84,25 @@ class Session:
     ctx_tokens: int = 0
     recent_events: list[ActivityEvent] = field(default_factory=list)
     bridge_session_id: str = ""  # set when connected to remote control (the bridge)
+    name: str = ""               # bg-job launch name (only set for background jobs)
+    is_background: bool = False   # kind == "bg": detached, no tmux pane
 
     @property
     def is_remote(self) -> bool:
         return bool(self.bridge_session_id)
+
+    @property
+    def is_attached_bg(self) -> bool:
+        # A background job whose name matched a pane title: viewable/jumpable.
+        return self.is_background and bool(self.tmux_target)
+
+    @property
+    def display_title(self) -> str:
+        # Background jobs carry an explicit launch name; prefer it, then fall
+        # back to the jsonl-derived ai-title.
+        if self.is_background:
+            return self.name or self.title
+        return self.title
 
     @property
     def age_seconds(self) -> float:
@@ -114,24 +141,55 @@ def pid_tty(pid: int) -> str | None:
     return tty
 
 
-def tmux_panes() -> dict[str, str]:
-    """Map pane_tty (without /dev/) -> 'session:window.pane'."""
+def _strip_status_glyph(title: str) -> str:
+    """Drop a leading status glyph from a pane title: '⠂ Foo' -> 'Foo'.
+
+    Claude sets pane titles to '<glyph> <session name>', where the glyph is a
+    single non-alphanumeric spinner/status character followed by a space.
+    """
+    title = title.strip()
+    head, sep, rest = title.partition(" ")
+    if sep and head and not head[0].isalnum() and len(head) <= 2:
+        return rest.strip()
+    return title
+
+
+def tmux_panes() -> tuple[dict[str, str], dict[str, str]]:
+    """Return (tty_map, title_map), both keyed to 'session:window.pane'.
+
+    tty_map:   pane_tty (without /dev/) -> target. Maps interactive sessions to
+               their pane via the session process's controlling tty.
+    title_map: pane title (raw and glyph-stripped) -> target. Lets us locate a
+               detached background job that's being viewed in a `claude agents`
+               / `claude attach` pane: that pane's title is the job's name, so
+               we match a bg job's name against it.
+    """
     try:
         out = subprocess.run(
             ["tmux", "list-panes", "-a", "-F",
-             "#{pane_tty}|#{session_name}:#{window_index}.#{pane_index}"],
+             "#{pane_tty}|#{session_name}:#{window_index}.#{pane_index}|#{pane_title}"],
             capture_output=True, text=True, timeout=2,
         )
     except (subprocess.SubprocessError, FileNotFoundError):
-        return {}
-    panes: dict[str, str] = {}
+        return {}, {}
+    tty_map: dict[str, str] = {}
+    title_map: dict[str, str] = {}
     for line in out.stdout.splitlines():
-        tty, _, target = line.partition("|")
+        parts = line.split("|", 2)
+        if len(parts) < 2:
+            continue
+        tty, target = parts[0], parts[1]
+        title = parts[2] if len(parts) > 2 else ""
         if tty.startswith("/dev/"):
             tty = tty[len("/dev/"):]
         if tty and target:
-            panes[tty] = target
-    return panes
+            tty_map[tty] = target
+        if title and target:
+            # First pane wins on a title collision (setdefault).
+            for key in (title.strip(), _strip_status_glyph(title)):
+                if key:
+                    title_map.setdefault(key, target)
+    return tty_map, title_map
 
 
 def _truncate(s: str, n: int = 80) -> str:
@@ -275,9 +333,7 @@ def session_meta(session_id: str) -> tuple[str, int, list[ActivityEvent]]:
 def load_sessions() -> list[Session]:
     if not SESSIONS_DIR.is_dir():
         return []
-    pane_map = tmux_panes()
-    if not pane_map:
-        return []
+    tty_map, title_map = tmux_panes()  # empty if no tmux server
     sessions: list[Session] = []
     for path in SESSIONS_DIR.glob("*.json"):
         try:
@@ -287,14 +343,25 @@ def load_sessions() -> list[Session]:
         pid = data.get("pid")
         if not isinstance(pid, int) or not pid_alive(pid):
             continue
-        if data.get("kind") != "interactive":
+        kind = data.get("kind")
+        if kind not in ("interactive", "bg"):
             continue
-        tty = pid_tty(pid)
-        if not tty:
-            continue
-        target = pane_map.get(tty)
-        if not target:
-            continue
+        name = str(data.get("name", ""))
+        # Interactive sessions must resolve to a live tmux pane via their tty
+        # (the thing Enter deep-links into); drop those that don't. Background
+        # jobs are daemon-hosted with no tty, but an attached one is viewed in a
+        # `claude agents` pane titled with the job name — match that for a jump
+        # target. Unmatched bg jobs are detached (target stays "").
+        target = ""
+        if kind == "interactive":
+            tty = pid_tty(pid)
+            if not tty:
+                continue
+            target = tty_map.get(tty, "")
+            if not target:
+                continue
+        elif name:
+            target = title_map.get(name, "")
         session_id = str(data.get("sessionId", ""))
         title, ctx_tokens, events = session_meta(session_id)
         sessions.append(Session(
@@ -309,6 +376,8 @@ def load_sessions() -> list[Session]:
             ctx_tokens=ctx_tokens,
             recent_events=events,
             bridge_session_id=str(data.get("bridgeSessionId", "")),
+            name=name,
+            is_background=(kind == "bg"),
         ))
     return sessions
 
@@ -319,10 +388,16 @@ STATUS_STYLE = {
 }
 
 
-def status_cell(status: str, *, remote: bool = False) -> str:
+def status_cell(
+    status: str, *, remote: bool = False, background: bool = False, attached: bool = False
+) -> str:
     label = status or "—"
     style = STATUS_STYLE.get(status, "dim")
     cell = f"[{style}]{label}[/]"
+    if background:
+        # Badge background jobs; ⇄ marks one attached to a pane (jumpable),
+        # plain BG marks a detached one (Enter yanks `claude attach`).
+        cell += " [bold cyan]BG⇄[/]" if attached else " [bold cyan]BG[/]"
     if remote:
         # Badge sessions driven by remote control (the bridge).
         cell += " [bold blue]🔗[/]"
@@ -460,19 +535,20 @@ class SessionsApp(App):
             self.refresh_sessions()
 
     def refresh_sessions(self) -> None:
-        # Preserve cursor target across refresh.
+        # Preserve the cursor's session across refresh. Key off the session id
+        # (stable and unique) rather than the tmux target, which is empty for
+        # background rows.
         table = self.query_one(DataTable)
-        prev_target = ""
-        if 0 <= table.cursor_row < len(self.row_targets):
-            prev_target = self.row_targets[table.cursor_row]
+        prev_id = ""
+        if 0 <= table.cursor_row < len(self.row_session_ids):
+            prev_id = self.row_session_ids[table.cursor_row]
 
         self.sessions = load_sessions()
         self._render()
 
         # Restore cursor.
-        if prev_target and prev_target in self.row_targets:
-            new_row = self.row_targets.index(prev_target)
-            table.move_cursor(row=new_row)
+        if prev_id and prev_id in self.row_session_ids:
+            table.move_cursor(row=self.row_session_ids.index(prev_id))
 
     def _sorted_sessions(self) -> list[Session]:
         if self.sort_mode == "age":
@@ -505,13 +581,18 @@ class SessionsApp(App):
 
     def _add_session_row(self, table: DataTable, s: Session, *, indent: bool) -> None:
         cwd_cell = ("  " + (Path(s.cwd).name or s.cwd_short)) if indent else s.cwd_short
-        tmux_session = s.tmux_target.split(":", 1)[0]
+        # A pane to show (interactive or attached bg) renders its session name;
+        # a detached background job has none.
+        tmux_cell = s.tmux_target.split(":", 1)[0] if s.tmux_target else "[dim]—[/]"
         table.add_row(
-            status_cell(s.status, remote=s.is_remote),
+            status_cell(
+                s.status, remote=s.is_remote,
+                background=s.is_background, attached=s.is_attached_bg,
+            ),
             format_age(s.age_seconds),
-            tmux_session,
+            tmux_cell,
             cwd_cell,
-            s.title or "[dim]—[/]",
+            s.display_title or "[dim]—[/]",
             format_ctx(s.ctx_tokens),
             s.session_id[:8],
         )
@@ -537,8 +618,10 @@ class SessionsApp(App):
         group = "on" if self.group_by_dir else "off"
         details = "on" if self.show_details else "off"
         count = len(self.sessions)
+        bg = sum(1 for s in self.sessions if s.is_background)
+        live_label = f"{count} live" + (f" ({bg} bg)" if bg else "")
         self.query_one("#header", Static).update(
-            f"Claude Sessions  •  {count} live  •  "
+            f"Claude Sessions  •  {live_label}  •  "
             f"sort: [b]{self.sort_mode}[/]  group: [b]{group}[/]  "
             f"details: [b]{details}[/]  auto-refresh: [b]{auto}[/]  "
             f"[dim](j/k move · enter open · y yank id · s sort · g group · d details · a auto · r refresh · q quit)[/]"
@@ -551,9 +634,10 @@ class SessionsApp(App):
         if table.row_count == 0:
             return
         new_row = (table.cursor_row + 1) % table.row_count
-        # Skip group-header rows.
+        # Skip non-session rows (group headers, detail rows). Keyed off the
+        # session id, not the tmux target, so background rows stay selectable.
         for _ in range(table.row_count):
-            if self.row_targets[new_row] != "":
+            if self.row_session_ids[new_row] != "":
                 break
             new_row = (new_row + 1) % table.row_count
         table.move_cursor(row=new_row)
@@ -564,19 +648,36 @@ class SessionsApp(App):
             return
         new_row = (table.cursor_row - 1) % table.row_count
         for _ in range(table.row_count):
-            if self.row_targets[new_row] != "":
+            if self.row_session_ids[new_row] != "":
                 break
             new_row = (new_row - 1) % table.row_count
         table.move_cursor(row=new_row)
+
+    def _copy(self, text: str) -> bool:
+        try:
+            subprocess.run(["pbcopy"], input=text, text=True, timeout=2)
+        except (subprocess.SubprocessError, FileNotFoundError):
+            self.notify("Failed to copy to clipboard", severity="error")
+            return False
+        return True
 
     def action_open(self) -> None:
         table = self.query_one(DataTable)
         if not (0 <= table.cursor_row < len(self.row_targets)):
             return
         target = self.row_targets[table.cursor_row]
-        if not target:
+        if target:
+            self.exit(result=target)
             return
-        self.exit(result=target)
+        # Background jobs are detached — no pane to jump to. Yank a
+        # `claude attach <short-id>` command instead. Stay silent on
+        # group-header / detail rows.
+        session_id = self.row_session_ids[table.cursor_row]
+        if not session_id:
+            return
+        cmd = f"claude attach {session_id.split('-', 1)[0]}"
+        if self._copy(cmd):
+            self.notify(f"Copied: {cmd}")
 
     def action_yank(self) -> None:
         table = self.query_one(DataTable)
@@ -585,12 +686,8 @@ class SessionsApp(App):
         session_id = self.row_session_ids[table.cursor_row]
         if not session_id:
             return
-        try:
-            subprocess.run(["pbcopy"], input=session_id, text=True, timeout=2)
-        except (subprocess.SubprocessError, FileNotFoundError):
-            self.notify("Failed to copy session id", severity="error")
-            return
-        self.notify(f"Copied {session_id}")
+        if self._copy(session_id):
+            self.notify(f"Copied {session_id}")
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         # DataTable swallows Enter; route its RowSelected to our open action.
