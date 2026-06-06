@@ -613,6 +613,7 @@ def load_codex_sessions(tty_map: dict[str, str]) -> list[Session]:
                    created_at_ms, updated_at_ms
             from threads
             where archived = 0
+              and id not in (select child_thread_id from thread_spawn_edges)
             order by updated_at_ms desc, id desc
             limit 500
             """
