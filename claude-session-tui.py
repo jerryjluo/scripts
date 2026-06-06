@@ -666,8 +666,8 @@ STATUS_STYLE = {
 }
 
 AGENT_STYLE = {
-    "claude": "blue",
-    "codex": "green",
+    "claude": "dark_orange",
+    "codex": "#5dade2",
 }
 
 
