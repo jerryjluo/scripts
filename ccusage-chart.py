@@ -6,7 +6,10 @@
 #     "pandas>=2.2",
 # ]
 # ///
-"""Plot ccusage daily/weekly/monthly costs plus a cumulative line chart."""
+"""Plot ccusage daily/weekly/monthly costs plus a cumulative line chart.
+
+Costs are split by agent (Claude Code vs Codex) and rendered as stacked bars.
+"""
 
 from __future__ import annotations
 
@@ -32,6 +35,21 @@ os.environ["PATH"] = os.pathsep.join([
     "/bin",
     os.environ.get("PATH", ""),
 ])
+
+
+# Per-agent series. Each tuple: (column name, display label, hex color, the
+# ccusage subcommand to fetch it from, and the cost field that subcommand uses).
+AGENTS = (
+    ("claude", "Claude Code", "#4C9AFF", "claude", "totalCost"),
+    ("codex", "Codex", "#10A37F", "codex", "costUSD"),
+)
+AGENT_COLS = [a[0] for a in AGENTS]
+
+
+def rgba(hex_color: str, alpha: float) -> str:
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i : i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r},{g},{b},{alpha})"
 
 
 PRESETS = (
@@ -92,9 +110,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def fetch_usage() -> list[dict]:
+def fetch_usage(subcommand: str) -> list[dict]:
     result = subprocess.run(
-        ["npx", "ccusage", "--json"],
+        ["npx", "ccusage", subcommand, "--json"],
         check=True,
         capture_output=True,
         text=True,
@@ -103,12 +121,25 @@ def fetch_usage() -> list[dict]:
     return data.get("daily", [])
 
 
-def build_daily(raw: list[dict]) -> pd.DataFrame:
-    df = pd.DataFrame(raw)
-    if df.empty:
+def build_daily() -> pd.DataFrame:
+    """One row per date with a cost column per agent (missing days -> 0)."""
+    series = []
+    for col, _label, _color, subcommand, cost_key in AGENTS:
+        raw = fetch_usage(subcommand)
+        if not raw:
+            series.append(pd.DataFrame({"date": pd.to_datetime([]), col: pd.Series(dtype=float)}))
+            continue
+        df = pd.DataFrame(raw)
+        df["date"] = pd.to_datetime(df["date"])
+        agg = df.groupby("date", as_index=False)[cost_key].sum()
+        series.append(agg.rename(columns={cost_key: col}))
+
+    merged = series[0]
+    for nxt in series[1:]:
+        merged = merged.merge(nxt, on="date", how="outer")
+    if merged.empty:
         sys.exit("ccusage returned no daily data")
-    df["date"] = pd.to_datetime(df["period"])
-    return df.groupby("date", as_index=False)["totalCost"].sum().sort_values("date")
+    return merged[["date", *AGENT_COLS]].fillna(0.0).sort_values("date").reset_index(drop=True)
 
 
 def slice_range(
@@ -118,8 +149,8 @@ def slice_range(
 ) -> pd.DataFrame:
     lo = pd.Timestamp(start) if start else daily["date"].min()
     hi = pd.Timestamp(end) if end else daily["date"].max()
-    if lo > hi:
-        return pd.DataFrame({"date": pd.to_datetime([]), "totalCost": []})
+    if pd.isna(lo) or pd.isna(hi) or lo > hi:
+        return pd.DataFrame({"date": pd.to_datetime([]), **{c: [] for c in AGENT_COLS}})
     masked = daily[(daily["date"] >= lo) & (daily["date"] <= hi)]
     full = pd.date_range(lo, hi, freq="D")
     return (
@@ -133,17 +164,19 @@ def slice_range(
 def aggregates(daily: pd.DataFrame) -> dict[str, pd.DataFrame]:
     weekly = (
         daily.set_index("date")
-        .resample("W-MON", label="left", closed="left")["totalCost"]
+        .resample("W-MON", label="left", closed="left")[AGENT_COLS]
         .sum()
         .reset_index()
     )
     monthly = (
         daily.set_index("date")
-        .resample("MS")["totalCost"]
+        .resample("MS")[AGENT_COLS]
         .sum()
         .reset_index()
     )
-    cumulative = daily.assign(cumulative=daily["totalCost"].cumsum())
+    cumulative = daily.copy()
+    for col in AGENT_COLS:
+        cumulative[f"{col}_cum"] = cumulative[col].cumsum()
     return {"daily": daily, "weekly": weekly, "monthly": monthly, "cumulative": cumulative}
 
 
@@ -160,7 +193,7 @@ def range_label(start: date | None, end: date | None) -> str:
 def main() -> None:
     args = parse_args(sys.argv[1:])
     today = date.today()
-    full_daily = build_daily(fetch_usage())
+    full_daily = build_daily()
 
     views: list[tuple[str, date | None, date | None, dict[str, pd.DataFrame]]] = []
     if args.start or args.end:
@@ -185,60 +218,57 @@ def main() -> None:
         ),
     )
 
-    traces_per_view = 4
+    # Per view we add: a stacked Bar pair (claude+codex) for daily/weekly/monthly,
+    # plus a stacked-area Scatter pair for cumulative — two traces per agent per row.
+    traces_per_view = 4 * len(AGENTS)
+    bar_rows = (
+        ("daily", "date", 1, "%{x|%Y-%m-%d}"),
+        ("weekly", "date", 2, "week of %{x|%Y-%m-%d}"),
+        ("monthly", "date", 3, "%{x|%Y-%m}"),
+    )
     for view_idx, (_, _, _, agg) in enumerate(views):
         visible = view_idx == default_idx
-        fig.add_trace(
-            go.Bar(
-                x=agg["daily"]["date"],
-                y=agg["daily"]["totalCost"],
-                name="Daily",
-                marker_color="#4C9AFF",
-                visible=visible,
-                hovertemplate="%{x|%Y-%m-%d}<br>$%{y:.2f}<extra></extra>",
-            ),
-            row=1, col=1,
-        )
-        fig.add_trace(
-            go.Bar(
-                x=agg["weekly"]["date"],
-                y=agg["weekly"]["totalCost"],
-                name="Weekly",
-                marker_color="#36B37E",
-                visible=visible,
-                hovertemplate="week of %{x|%Y-%m-%d}<br>$%{y:.2f}<extra></extra>",
-            ),
-            row=2, col=1,
-        )
-        fig.add_trace(
-            go.Bar(
-                x=agg["monthly"]["date"],
-                y=agg["monthly"]["totalCost"],
-                name="Monthly",
-                marker_color="#FF8B00",
-                visible=visible,
-                hovertemplate="%{x|%Y-%m}<br>$%{y:.2f}<extra></extra>",
-            ),
-            row=3, col=1,
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=agg["cumulative"]["date"],
-                y=agg["cumulative"]["cumulative"],
-                name="Cumulative",
-                mode="lines",
-                line=dict(color="#6554C0", width=2),
-                fill="tozeroy",
-                fillcolor="rgba(101,84,192,0.15)",
-                visible=visible,
-                hovertemplate="%{x|%Y-%m-%d}<br>$%{y:.2f}<extra></extra>",
-            ),
-            row=4, col=1,
-        )
+        for key, xcol, row, xfmt in bar_rows:
+            for col, label, color, _sub, _ck in AGENTS:
+                fig.add_trace(
+                    go.Bar(
+                        x=agg[key][xcol],
+                        y=agg[key][col],
+                        name=label,
+                        legendgroup=label,
+                        showlegend=(row == 1),
+                        marker_color=color,
+                        visible=visible,
+                        hovertemplate=f"{xfmt}<br>{label}: $%{{y:.2f}}<extra></extra>",
+                    ),
+                    row=row, col=1,
+                )
+        for col, label, color, _sub, _ck in AGENTS:
+            fig.add_trace(
+                go.Scatter(
+                    x=agg["cumulative"]["date"],
+                    y=agg["cumulative"][f"{col}_cum"],
+                    name=label,
+                    legendgroup=label,
+                    showlegend=False,
+                    mode="lines",
+                    line=dict(color=color, width=1.5),
+                    stackgroup=f"cum{view_idx}",
+                    fillcolor=rgba(color, 0.30),
+                    visible=visible,
+                    hovertemplate=f"%{{x|%Y-%m-%d}}<br>{label}: $%{{y:.2f}}<extra></extra>",
+                ),
+                row=4, col=1,
+            )
 
     def title_for(label: str, s: date | None, e: date | None, agg: dict[str, pd.DataFrame]) -> str:
-        total = agg["cumulative"]["cumulative"].iloc[-1] if len(agg["cumulative"]) else 0.0
-        return f"ccusage spend — {label} ({range_label(s, e)}) — total ${total:,.2f}"
+        cum = agg["cumulative"]
+        totals = {c: (cum[f"{c}_cum"].iloc[-1] if len(cum) else 0.0) for c in AGENT_COLS}
+        grand = sum(totals.values())
+        breakdown = " · ".join(
+            f"{lbl} ${totals[c]:,.2f}" for c, lbl, *_ in AGENTS
+        )
+        return f"ccusage spend — {label} ({range_label(s, e)}) — total ${grand:,.2f} ({breakdown})"
 
     buttons = []
     for view_idx, (label, s, e, agg) in enumerate(views):
@@ -256,9 +286,21 @@ def main() -> None:
 
     default_view = views[default_idx]
     fig.update_layout(
-        title=title_for(default_view[0], default_view[1], default_view[2], default_view[3]),
+        title=dict(
+            text=title_for(default_view[0], default_view[1], default_view[2], default_view[3]),
+            x=0.5, xanchor="center",
+            y=0.985, yanchor="top",
+            font=dict(size=16),
+        ),
         height=1100,
-        showlegend=False,
+        margin=dict(t=120, l=80, r=80, b=80),
+        showlegend=True,
+        barmode="stack",
+        legend=dict(
+            orientation="h",
+            x=0.5, xanchor="center",
+            y=1.05, yanchor="top",
+        ),
         template="plotly_white",
         bargap=0.15,
         updatemenus=[dict(
@@ -267,8 +309,8 @@ def main() -> None:
             active=default_idx,
             x=1.0,
             xanchor="right",
-            y=1.06,
-            yanchor="bottom",
+            y=1.05,
+            yanchor="top",
             bgcolor="white",
             bordercolor="#cbd5e0",
             pad={"l": 8, "r": 8, "t": 4, "b": 4},
@@ -276,7 +318,7 @@ def main() -> None:
         annotations=list(fig.layout.annotations) + [dict(
             text="Range:",
             x=1.0, xref="paper", xanchor="right",
-            y=1.10, yref="paper", yanchor="bottom",
+            y=1.045, yref="paper", yanchor="top",
             showarrow=False,
             xshift=-130,
             font=dict(size=12, color="#4a5568"),
