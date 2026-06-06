@@ -5,9 +5,9 @@
 #     "textual>=0.85",
 # ]
 # ///
-"""TUI for browsing live Claude Code sessions.
+"""TUI for browsing live Claude Code and Codex sessions.
 
-Reads ~/.claude/sessions/*.json and shows two kinds of live session:
+Reads ~/.claude/sessions/*.json and shows two kinds of live Claude session:
 interactive sessions attached to a tmux pane, and background jobs (kind ==
 "bg", hosted detached by the `claude daemon`). Interactive rows that don't map
 to a current tmux pane are dropped; background rows are always kept, badged
@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import time
 from collections import deque
@@ -38,22 +39,30 @@ from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
 from textual.reactive import reactive
 from textual.widgets import DataTable, Footer, Static
 
-SESSIONS_DIR = Path.home() / ".claude" / "sessions"
-PROJECTS_DIR = Path.home() / ".claude" / "projects"
+CLAUDE_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+CODEX_HOME = Path.home() / ".codex"
+CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
 
 # Per-session jsonl-derived info, cached by file mtime.
 # sessionId -> (jsonl_mtime, title, context_tokens, recent_events)
 _META_CACHE: dict[str, tuple[float, str, int, list["ActivityEvent"]]] = {}
+
+# Per-Codex rollout info, cached by file mtime/size.
+# rollout_path -> (mtime, size, status, ctx_tokens, ctx_limit, recent_events)
+_CODEX_META_CACHE: dict[str, tuple[float, int, str, int, int, list["ActivityEvent"]]] = {}
 
 # Default model context window in tokens. Override with CLAUDE_CONTEXT_LIMIT env.
 CONTEXT_LIMIT = int(os.environ.get("CLAUDE_CONTEXT_LIMIT", "1000000"))
 
 # Number of recent activity events to display under each session row.
 DETAIL_ROWS = 3
+
+# Keep long titles from pushing Ctx/Session off-screen. Override when needed.
+NAME_WIDTH = int(os.environ.get("SESSION_TUI_NAME_WIDTH", "56"))
 
 TERM_BUNDLE_IDS = {
     "ghostty": "com.mitchellh.ghostty",
@@ -73,6 +82,7 @@ class ActivityEvent:
 
 @dataclass
 class Session:
+    provider: str  # "claude" | "codex"
     pid: int
     session_id: str
     cwd: str
@@ -82,10 +92,16 @@ class Session:
     tmux_target: str  # e.g. "main:2.0"
     title: str = ""
     ctx_tokens: int = 0
+    ctx_limit: int = CONTEXT_LIMIT
     recent_events: list[ActivityEvent] = field(default_factory=list)
     bridge_session_id: str = ""  # set when connected to remote control (the bridge)
     name: str = ""               # bg-job launch name (only set for background jobs)
     is_background: bool = False   # kind == "bg": detached, no tmux pane
+    attach_command: str = ""      # copied on Enter when there is no pane target
+
+    @property
+    def row_key(self) -> str:
+        return f"{self.provider}:{self.session_id}"
 
     @property
     def is_remote(self) -> bool:
@@ -269,7 +285,11 @@ def session_meta(session_id: str) -> tuple[str, int, list[ActivityEvent]]:
     """
     if not session_id:
         return "", 0, []
-    matches = list(PROJECTS_DIR.glob(f"*/{session_id}.jsonl")) if PROJECTS_DIR.is_dir() else []
+    matches = (
+        list(CLAUDE_PROJECTS_DIR.glob(f"*/{session_id}.jsonl"))
+        if CLAUDE_PROJECTS_DIR.is_dir()
+        else []
+    )
     if not matches:
         cached = _META_CACHE.get(session_id)
         return (cached[1], cached[2], cached[3]) if cached else ("", 0, [])
@@ -330,12 +350,11 @@ def session_meta(session_id: str) -> tuple[str, int, list[ActivityEvent]]:
     return title, ctx_tokens, recent
 
 
-def load_sessions() -> list[Session]:
-    if not SESSIONS_DIR.is_dir():
+def load_claude_sessions(tty_map: dict[str, str], title_map: dict[str, str]) -> list[Session]:
+    if not CLAUDE_SESSIONS_DIR.is_dir():
         return []
-    tty_map, title_map = tmux_panes()  # empty if no tmux server
     sessions: list[Session] = []
-    for path in SESSIONS_DIR.glob("*.json"):
+    for path in CLAUDE_SESSIONS_DIR.glob("*.json"):
         try:
             data = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
@@ -365,6 +384,7 @@ def load_sessions() -> list[Session]:
         session_id = str(data.get("sessionId", ""))
         title, ctx_tokens, events = session_meta(session_id)
         sessions.append(Session(
+            provider="claude",
             pid=pid,
             session_id=session_id,
             cwd=str(data.get("cwd", "")),
@@ -378,14 +398,281 @@ def load_sessions() -> list[Session]:
             bridge_session_id=str(data.get("bridgeSessionId", "")),
             name=name,
             is_background=(kind == "bg"),
+            attach_command=f"claude attach {session_id.split('-', 1)[0]}" if kind == "bg" else "",
         ))
     return sessions
+
+
+def codex_state_db() -> Path | None:
+    override = os.environ.get("CODEX_STATE_DB")
+    if override:
+        path = Path(override).expanduser()
+        return path if path.exists() else None
+    if not CODEX_HOME.is_dir():
+        return None
+    try:
+        return max(CODEX_HOME.glob("state_*.sqlite"), key=lambda p: p.stat().st_mtime)
+    except (ValueError, OSError):
+        return None
+
+
+def codex_process_pids() -> list[int]:
+    try:
+        out = subprocess.run(
+            ["ps", "-axo", "pid=,comm=,args="],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return []
+    pids: list[int] = []
+    for line in out.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        text = " ".join(parts[1:]).lower()
+        if pid != os.getpid() and "codex" in text:
+            pids.append(pid)
+    return pids
+
+
+def codex_rollouts_open_by_pid(pid: int) -> list[Path]:
+    try:
+        out = subprocess.run(
+            ["lsof", "-Fn", "-p", str(pid)],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return []
+    prefix = str(CODEX_SESSIONS_DIR)
+    paths: list[Path] = []
+    for line in out.stdout.splitlines():
+        if not line.startswith("n"):
+            continue
+        name = line[1:]
+        if name.startswith(prefix) and name.endswith(".jsonl"):
+            paths.append(Path(name))
+    return paths
+
+
+def codex_rollout_targets(tty_map: dict[str, str]) -> dict[str, tuple[int, str]]:
+    targets: dict[str, tuple[int, str]] = {}
+    for pid in codex_process_pids():
+        tty = pid_tty(pid)
+        if not tty:
+            continue
+        target = tty_map.get(tty, "")
+        if not target:
+            continue
+        for rollout in codex_rollouts_open_by_pid(pid):
+            targets.setdefault(str(rollout), (pid, target))
+    return targets
+
+
+def _format_codex_tool(payload: dict) -> str:
+    name = str(payload.get("name") or "tool")
+    args = payload.get("arguments")
+    parsed: object = None
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+        except json.JSONDecodeError:
+            parsed = None
+    elif isinstance(args, dict):
+        parsed = args
+
+    preview = ""
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("cmd"), str):
+            preview = _truncate(str(parsed.get("cmd")), 80)
+        elif isinstance(parsed.get("command"), str):
+            preview = _truncate(str(parsed.get("command")), 80)
+        elif isinstance(parsed.get("path"), str):
+            preview = Path(str(parsed.get("path"))).name
+        elif isinstance(parsed.get("file_path"), str):
+            preview = Path(str(parsed.get("file_path"))).name
+        else:
+            for value in parsed.values():
+                if isinstance(value, str) and value:
+                    preview = _truncate(value, 60)
+                    break
+    return f"{name}: {preview}" if preview else name
+
+
+def _classify_codex_event(d: dict) -> ActivityEvent | None:
+    ts = str(d.get("timestamp", ""))
+    t = d.get("type")
+    payload = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+
+    if t == "event_msg":
+        event_type = payload.get("type")
+        if event_type == "user_message":
+            message = str(payload.get("message") or "")
+            return ActivityEvent(ts, "user", _truncate(message, 100)) if message.strip() else None
+        if event_type == "agent_message":
+            message = str(payload.get("message") or "")
+            return ActivityEvent(ts, "text", _truncate(message, 100)) if message.strip() else None
+        return None
+
+    if t == "response_item":
+        item_type = payload.get("type")
+        if item_type == "function_call":
+            return ActivityEvent(ts, "tool", _format_codex_tool(payload))
+        if item_type == "message":
+            content = payload.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "output_text":
+                        text = _truncate(str(block.get("text") or ""), 100)
+                        if text:
+                            return ActivityEvent(ts, "text", text)
+        return None
+
+    return None
+
+
+def codex_meta(rollout_path: Path) -> tuple[str, int, int, list[ActivityEvent]]:
+    try:
+        stat = rollout_path.stat()
+    except OSError:
+        cached = _CODEX_META_CACHE.get(str(rollout_path))
+        return (cached[2], cached[3], cached[4], cached[5]) if cached else ("", 0, CONTEXT_LIMIT, [])
+
+    cache_key = str(rollout_path)
+    cached = _CODEX_META_CACHE.get(cache_key)
+    if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+        return cached[2], cached[3], cached[4], cached[5]
+
+    busy = False
+    ctx_tokens = 0
+    ctx_limit = CONTEXT_LIMIT
+    events: deque[ActivityEvent] = deque(maxlen=DETAIL_ROWS * 4)
+    last_user: ActivityEvent | None = None
+    try:
+        with rollout_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"type"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("type") == "event_msg":
+                    payload = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+                    event_type = payload.get("type")
+                    if event_type == "task_started":
+                        busy = True
+                    elif event_type in ("task_complete", "turn_aborted"):
+                        busy = False
+                    elif event_type == "token_count":
+                        info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+                        usage = (
+                            info.get("last_token_usage")
+                            if isinstance(info.get("last_token_usage"), dict)
+                            else {}
+                        )
+                        total = int(usage.get("total_tokens", 0) or 0)
+                        if total > 0:
+                            ctx_tokens = total
+                        limit = int(info.get("model_context_window", 0) or 0)
+                        if limit > 0:
+                            ctx_limit = limit
+                ev = _classify_codex_event(d)
+                if ev:
+                    events.append(ev)
+                    if ev.kind == "user":
+                        last_user = ev
+    except OSError:
+        pass
+
+    status = "busy" if busy else "idle"
+    recent = list(events)[-DETAIL_ROWS:]
+    if last_user and last_user not in recent:
+        recent = [last_user] + recent[1:] if len(recent) >= DETAIL_ROWS else [last_user] + recent
+    _CODEX_META_CACHE[cache_key] = (stat.st_mtime, stat.st_size, status, ctx_tokens, ctx_limit, recent)
+    return status, ctx_tokens, ctx_limit, recent
+
+
+def load_codex_sessions(tty_map: dict[str, str]) -> list[Session]:
+    db_path = codex_state_db()
+    if not db_path:
+        return []
+    rollout_targets = codex_rollout_targets(tty_map)
+    if not rollout_targets:
+        return []
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            select id, rollout_path, cwd, title, preview,
+                   created_at_ms, updated_at_ms
+            from threads
+            where archived = 0
+            order by updated_at_ms desc, id desc
+            limit 500
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        try:
+            conn.close()
+        except UnboundLocalError:
+            pass
+
+    sessions: list[Session] = []
+    for row in rows:
+        rollout_path = str(row["rollout_path"] or "")
+        if not rollout_path:
+            continue
+        live = rollout_targets.get(rollout_path)
+        if not live:
+            continue
+        pid, target = live
+        path = Path(rollout_path)
+        status, ctx_tokens, ctx_limit, events = codex_meta(path)
+        title = str(row["title"] or row["preview"] or "")
+        sessions.append(Session(
+            provider="codex",
+            pid=pid,
+            session_id=str(row["id"] or ""),
+            cwd=str(row["cwd"] or ""),
+            status=status,
+            started_at_ms=int(row["created_at_ms"] or 0),
+            updated_at_ms=int(row["updated_at_ms"] or 0),
+            tmux_target=target,
+            title=title,
+            ctx_tokens=ctx_tokens,
+            ctx_limit=ctx_limit,
+            recent_events=events,
+        ))
+    return sessions
+
+
+def load_sessions() -> list[Session]:
+    tty_map, title_map = tmux_panes()  # empty if no tmux server
+    return load_claude_sessions(tty_map, title_map) + load_codex_sessions(tty_map)
 
 
 STATUS_STYLE = {
     "busy": "dark_orange",   # running
     "idle": "green",         # waiting for user
 }
+
+AGENT_STYLE = {
+    "claude": "blue",
+    "codex": "green",
+}
+
+
+def agent_cell(provider: str) -> str:
+    style = AGENT_STYLE.get(provider, "white")
+    return f"[{style}]{provider}[/]"
 
 
 def status_cell(
@@ -516,6 +803,8 @@ class SessionsApp(App):
         self.sessions: list[Session] = []
         self.row_targets: list[str] = []  # parallel to table rows; "" = group header
         self.row_session_ids: list[str] = []  # parallel to table rows; full session id
+        self.row_session_keys: list[str] = []  # parallel to table rows; provider:id
+        self.row_attach_commands: list[str] = []  # parallel to table rows
         self._timer = None
 
     def compose(self) -> ComposeResult:
@@ -526,7 +815,14 @@ class SessionsApp(App):
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
         table.cursor_foreground_priority = "renderable"
-        table.add_columns("Status", "Age", "Tmux", "Directory", "Name", "Ctx", "Session")
+        table.add_column("Agent", width=7)
+        table.add_column("Status", width=14)
+        table.add_column("Age", width=5)
+        table.add_column("Tmux", width=14)
+        table.add_column("Directory")
+        table.add_column("Name", width=NAME_WIDTH)
+        table.add_column("Ctx", width=5)
+        table.add_column("Session", width=8)
         self.refresh_sessions()
         self._timer = self.set_interval(1.0, self._tick)
 
@@ -539,16 +835,16 @@ class SessionsApp(App):
         # (stable and unique) rather than the tmux target, which is empty for
         # background rows.
         table = self.query_one(DataTable)
-        prev_id = ""
-        if 0 <= table.cursor_row < len(self.row_session_ids):
-            prev_id = self.row_session_ids[table.cursor_row]
+        prev_key = ""
+        if 0 <= table.cursor_row < len(self.row_session_keys):
+            prev_key = self.row_session_keys[table.cursor_row]
 
         self.sessions = load_sessions()
         self._render()
 
         # Restore cursor.
-        if prev_id and prev_id in self.row_session_ids:
-            table.move_cursor(row=self.row_session_ids.index(prev_id))
+        if prev_key and prev_key in self.row_session_keys:
+            table.move_cursor(row=self.row_session_keys.index(prev_key))
 
     def _sorted_sessions(self) -> list[Session]:
         if self.sort_mode == "age":
@@ -560,6 +856,8 @@ class SessionsApp(App):
         table.clear()
         self.row_targets = []
         self.row_session_ids = []
+        self.row_session_keys = []
+        self.row_attach_commands = []
 
         sessions = self._sorted_sessions()
 
@@ -568,9 +866,11 @@ class SessionsApp(App):
             for s in sessions:
                 groups.setdefault(s.cwd_short, []).append(s)
             for cwd_short in sorted(groups.keys(), key=str.lower):
-                table.add_row("", "", "", f"[bold cyan]{cwd_short}[/]", "", "", "")
+                table.add_row("", "", "", "", f"[bold cyan]{cwd_short}[/]", "", "", "")
                 self.row_targets.append("")
                 self.row_session_ids.append("")
+                self.row_session_keys.append("")
+                self.row_attach_commands.append("")
                 for s in sorted(groups[cwd_short], key=lambda x: x.age_seconds):
                     self._add_session_row(table, s, indent=True)
         else:
@@ -585,6 +885,7 @@ class SessionsApp(App):
         # a detached background job has none.
         tmux_cell = s.tmux_target.split(":", 1)[0] if s.tmux_target else "[dim]—[/]"
         table.add_row(
+            agent_cell(s.provider),
             status_cell(
                 s.status, remote=s.is_remote,
                 background=s.is_background, attached=s.is_attached_bg,
@@ -592,17 +893,20 @@ class SessionsApp(App):
             format_age(s.age_seconds),
             tmux_cell,
             cwd_cell,
-            s.display_title or "[dim]—[/]",
-            format_ctx(s.ctx_tokens),
+            _truncate(s.display_title, NAME_WIDTH) or "[dim]—[/]",
+            format_ctx(s.ctx_tokens, s.ctx_limit),
             s.session_id[:8],
         )
         self.row_targets.append(s.tmux_target)
         self.row_session_ids.append(s.session_id)
+        self.row_session_keys.append(s.row_key)
+        self.row_attach_commands.append(s.attach_command)
         if self.show_details and s.recent_events:
             n = len(s.recent_events)
             for i, ev in enumerate(s.recent_events):
                 is_last = i == n - 1
                 table.add_row(
+                    "",
                     "",
                     f"[dim]{format_age(event_age_seconds(ev.ts_iso))}[/]",
                     "",
@@ -612,16 +916,23 @@ class SessionsApp(App):
                 )
                 self.row_targets.append("")
                 self.row_session_ids.append("")
+                self.row_session_keys.append("")
+                self.row_attach_commands.append("")
 
     def _update_header(self) -> None:
         auto = "on" if self.auto_refresh else "off"
         group = "on" if self.group_by_dir else "off"
         details = "on" if self.show_details else "off"
         count = len(self.sessions)
+        claude = sum(1 for s in self.sessions if s.provider == "claude")
+        codex = sum(1 for s in self.sessions if s.provider == "codex")
         bg = sum(1 for s in self.sessions if s.is_background)
-        live_label = f"{count} live" + (f" ({bg} bg)" if bg else "")
+        parts = [f"{count} live", f"{claude} claude", f"{codex} codex"]
+        if bg:
+            parts.append(f"{bg} bg")
+        live_label = " (" + ", ".join(parts[1:]) + ")" if count else ""
         self.query_one("#header", Static).update(
-            f"Claude Sessions  •  {live_label}  •  "
+            f"Agent Sessions  •  {parts[0]}{live_label}  •  "
             f"sort: [b]{self.sort_mode}[/]  group: [b]{group}[/]  "
             f"details: [b]{details}[/]  auto-refresh: [b]{auto}[/]  "
             f"[dim](j/k move · enter open · y yank id · s sort · g group · d details · a auto · r refresh · q quit)[/]"
@@ -637,7 +948,7 @@ class SessionsApp(App):
         # Skip non-session rows (group headers, detail rows). Keyed off the
         # session id, not the tmux target, so background rows stay selectable.
         for _ in range(table.row_count):
-            if self.row_session_ids[new_row] != "":
+            if self.row_session_keys[new_row] != "":
                 break
             new_row = (new_row + 1) % table.row_count
         table.move_cursor(row=new_row)
@@ -648,7 +959,7 @@ class SessionsApp(App):
             return
         new_row = (table.cursor_row - 1) % table.row_count
         for _ in range(table.row_count):
-            if self.row_session_ids[new_row] != "":
+            if self.row_session_keys[new_row] != "":
                 break
             new_row = (new_row - 1) % table.row_count
         table.move_cursor(row=new_row)
@@ -669,13 +980,11 @@ class SessionsApp(App):
         if target:
             self.exit(result=target)
             return
-        # Background jobs are detached — no pane to jump to. Yank a
-        # `claude attach <short-id>` command instead. Stay silent on
-        # group-header / detail rows.
-        session_id = self.row_session_ids[table.cursor_row]
-        if not session_id:
+        # Detached Claude background jobs have no pane; copy their attach
+        # command instead. Stay silent on group-header / detail rows.
+        cmd = self.row_attach_commands[table.cursor_row]
+        if not cmd:
             return
-        cmd = f"claude attach {session_id.split('-', 1)[0]}"
         if self._copy(cmd):
             self.notify(f"Copied: {cmd}")
 
